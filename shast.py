@@ -2,11 +2,13 @@ import re
 
 class AST:
     def __init__(self, name, input, start, end, children=[]):
+
         self.name = name
         self.input = input
         self.start = start
         self.end = end
         self.len = self.end - self.start
+
         if self.len < 0:
             raise ValueError("invalid start/end")
         self.children = children
@@ -21,7 +23,7 @@ class AST:
                 x.dump_tree(indent+1)
 
     def __str__(self):
-        return bytes(self.input[self.start:self.end]).decode("utf8")
+        return bytes(self.input[self.start:self.end]).decode()
 
     def __repr__(self):
         return f"<{self.name} {self.start}:{self.end}>"
@@ -30,23 +32,25 @@ class AST:
         return self.len
 
 class Token:
-    def __init__(self, name, x):
+    def __init__(self, name, x, type=AST):
         x = x.encode("utf8")
         self.name = name
         self.tok = re.compile(x)
+        self.ast = type
 
     def _match(self, input, start):
         m = self.tok.match(bytes(input[start:]))
         if m:
-            return AST(self.name, input, start + m.start(), start + m.end())
+            return self.ast(self.name, input, start + m.start(), start + m.end())
 
     def __repr__(self):
         return f"{self.name}"
 
 class Production:
     # does not support backtracking so far (no need)
-    def __init__(self, name=None, prod=None):
+    def __init__(self, name=None, prod=None, type=AST):
         self.name = name
+        self.ast = type
         if prod == None:
             self._productions = []
         else:
@@ -76,12 +80,15 @@ class Production:
                 return None
             end += len(m)
             children.append(m)
-        return AST(self.name, input, start, end, children)
+        return self.ast(self.name, input, start, end, children)
 
     def __or__(self, other):
         if not isinstance(other, Production):
             raise ValueError(f"invalid production value: {prod}: not a production")
         self._productions.extend(other._productions)
+        if self.ast == AST and other.ast != AST:
+            self.ast = other.ast
+
         return self
 
     def __repr__(self):
@@ -105,12 +112,52 @@ class Parser:
             c = chr(self.ast.input[-1])
             raise ValueError(f"parsing error: unexpected char near {i}: ({c})")
 
-# not shlex, shast
-class shast(Parser):
-    # in a class just so i can use
-    # __set_, name__ for debugging/printing the ast
-    # sue me
+class InvocationNode(AST):
+    def __iter__(self):
+        yield self.Arg
+        try:
+            for x in self.Invocation:
+                yield x
+        except AttributeError:
+            pass
 
+    def args(self):
+        for x in self:
+            try:
+                yield x.Text
+            except AttributeError:
+                pass
+
+    def redirects(self):
+        for x in self:
+            try:
+                yield x.Redirect
+            except AttributeError:
+                pass
+
+class PipelineNode(AST):
+    def __iter__(self):
+        yield self.Invocation
+        try:
+            for x in self.EPipeline.Pipeline:
+                yield x
+        except AttributeError:
+            pass
+
+class GroupNode(AST):
+    def __iter__(self):
+        try:
+            yield self.EmptyCommand.Pipeline
+        except AttributeError:
+            pass
+
+        try:
+            for x in self.EGroup.Group:
+                yield x
+        except AttributeError:
+            pass
+
+class shast(Parser):
     EMPTY = Token("EMPTY", r"")
     Empty = Production("Empty", prod=[EMPTY])
 
@@ -126,7 +173,7 @@ class shast(Parser):
 
     ESC = Token("ESC", r"\\")
     STRCHAR = Token("STRCHAR", r'[^"\'\\]')
-    ARGCHAR = Token("ARGCHAR", r'[^"\'\s\|;>]')
+    ARGCHAR = Token("ARGCHAR", r'[^"\'\s\|;\(\)&>]')
 
     SChar = Production("SChar")
     ESChar = Production("ESChar", prod=[SChar]) | Empty
@@ -165,11 +212,11 @@ class shast(Parser):
     Arg |= Production("Arg", prod=[Text])
     Arg |= Production("Arg", prod=[Redirect])
 
-    Invocation  = Production("Invocation")
+    Invocation  = Production("Invocation", type=InvocationNode)
     Invocation |= Production("Invocation", prod=[Arg, WS, Invocation])
     Invocation |= Production("Invocation", prod=[Arg])
 
-    Pipeline  = Production("Pipeline")
+    Pipeline  = Production("Pipeline", type=PipelineNode)
     EPipeline = Production("EPipeline", prod=[PIPE, Pipeline]) | Empty
     Pipeline |= Production("Pipeline", prod=[WSE, Invocation, WSE, EPipeline])
 
@@ -177,40 +224,26 @@ class shast(Parser):
     EmptyCommand |= Production("Pipeline", [Pipeline])
     EmptyCommand |= Production("Empty", [Empty])
 
-    Group = Production("Group")
+    Group = Production("Group", type=GroupNode)
     EGroup = Production("EGroup", prod=[SEMICOLON, Group]) | Empty
     Group |= Production("Group", prod=[EmptyCommand, EGroup])
 
     Program = Production("Program", [Group])
 
-    def args(self, invocation):
-        yield invocation.Arg
-        try:
-            for x in self.args(invocation.Invocation):
-                yield x
-        except AttributeError:
-            pass
-
-    def invocations(self, pipeline):
-        yield pipeline.Invocation
-        try:
-            for x in self.invocations(pipeline.EPipeline.Pipeline):
-                yield x
-        except AttributeError:
-            pass
-
-    def commands(self, group=None):
-        for x in self._commands(self.ast.Group):
+    def __iter__(self):
+        for x in self.ast.Group:
             yield x
 
-    def _commands(self, group):
-        try:
-            yield group.EmptyCommand.Pipeline
-        except AttributeError:
-            pass
+if __name__ == "__main__":
+    ast = shast(b'echo "first line"; echo "second line"; echo "not second line" | grep -v first | sort -u > out.txt')
+    for grp in ast:
+        print(repr(grp), repr(str(grp)))
+        for cmd in grp:
+            print(" ", repr(cmd), repr(str(cmd)))
 
-        try:
-            for x in self._commands(group.EGroup.Group):
-                yield x
-        except AttributeError:
-            pass
+            for arg in cmd.args():
+                print("  ", repr(arg), repr(str(arg)))
+
+            for redirect in cmd.redirects():
+                print("  ", repr(redirect), repr(str(redirect)))
+
